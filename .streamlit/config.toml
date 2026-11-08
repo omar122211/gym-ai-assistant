@@ -1,0 +1,13 @@
+[client]
+toolbarMode = "viewer"      # hide developer menu / Deploy button
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+maxUploadSize = 1           # the app takes no uploads
+
+[theme]
+base = "dark"
+primaryColor = "#ff6b2c"

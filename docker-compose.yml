@@ -1,0 +1,31 @@
+# docker compose up --build   →  chat UI on http://localhost:8501, API docs on http://localhost:8000/docs
+services:
+  api:
+    build: .
+    env_file: .env                     # GEMINI_API_KEY lives here (never baked into the image)
+    volumes:
+      - gym-data:/app/data             # vector index, bookings and conversation memory survive restarts
+    ports:
+      - "127.0.0.1:8000:8000"          # local machine only
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "ui/streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    environment:
+      API_URL: http://api:8000         # the UI never sees the API key
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  gym-data:

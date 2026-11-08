@@ -45,7 +45,8 @@ class GeminiProvider:
 
         self._genai_types = __import__("google.genai.types", fromlist=["types"])
         self._errors = __import__("google.genai.errors", fromlist=["errors"])
-        self.client = genai.Client(api_key=api_key)
+        # timeout in ms: a hung request must fail (and be retried) instead of blocking forever
+        self.client = genai.Client(api_key=api_key, http_options=self._genai_types.HttpOptions(timeout=30_000))
         self.chat_model, self.embed_model, self.embed_dim = chat_model, embed_model, embed_dim
         self.fallback_chat_model = fallback_chat_model
         self.max_retries = max_retries
@@ -102,7 +103,7 @@ class GeminiProvider:
                 break
             except AIProviderError as e:
                 # model overloaded or out of quota → try the next model instead of failing the user
-                if e.code in (429, 503) and i + 1 < len(models):
+                if e.code in self._RETRYABLE and i + 1 < len(models):
                     log.warning("gemini fallback", extra={"fields": {"from": model, "to": models[i + 1], "code": e.code}})
                     continue
                 raise

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # AI provider (Google Gemini API, free tier)
     gemini_api_key: SecretStr | None = None
     chat_model: str = "gemini-3.5-flash-lite"
-    fallback_chat_model: str | None = "gemini-3.8-flash"  # used when the main model is overloaded (503/429)
+    fallback_chat_model: str | None = "gemini-3.8-flash"  # used when the main model is overloaded or times out (429/5xx)
     embed_model: str = "gemini-embedding-2"
     embed_dim: int = 768
 
