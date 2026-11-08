@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # AI provider (Google Gemini API, free tier)
     gemini_api_key: SecretStr | None = None
     chat_model: str = "gemini-3.5-flash-lite"
+    fallback_chat_model: str | None = "gemini-3.8-flash"  # used when the main model is overloaded (503/429)
     embed_model: str = "gemini-embedding-2"
     embed_dim: int = 768
 
@@ -23,6 +24,10 @@ class Settings(BaseSettings):
     collection: str = "gym_kb"
     top_k: int = 4
     min_similarity: float = 0.55  # measured: real matches score 0.67-0.77, unrelated 0.51-0.61
+
+    # Agent: gym database (schedule, bookings, tickets) and conversation memory
+    gym_db_path: Path = ROOT / "data" / "gym.db"
+    memory_db_path: Path = ROOT / "data" / "memory.db"
 
     # API safety limits
     max_question_chars: int = 500

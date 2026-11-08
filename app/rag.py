@@ -45,7 +45,7 @@ class Answer(BaseModel):
 
 
 class RAGService:
-    def __init__(self, kb: KnowledgeBase, provider: AIProvider, top_k: int = 4, min_similarity: float = 0.45):
+    def __init__(self, kb: KnowledgeBase, provider: AIProvider, top_k: int = 4, min_similarity: float = 0.55):
         self.kb, self.provider, self.top_k, self.min_similarity = kb, provider, top_k, min_similarity
 
     def retrieve(self, question: str) -> list[dict]:

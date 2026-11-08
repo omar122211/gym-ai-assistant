@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, field_validator
 
+from app.agent import ChatResult, GymAgent
 from app.config import Settings, get_settings
+from app.gym_db import GymDB
 from app.knowledge import KnowledgeBase, load_chunks
 from app.logging_setup import setup_logging
 from app.providers import AIProvider, AIProviderError, build_provider
@@ -29,6 +33,20 @@ class AskRequest(BaseModel):
         v = " ".join(v.split())  # collapse whitespace / control characters
         if not v:
             raise ValueError("question is empty")
+        return v
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, description="The member's message, in any language")
+    # Random id from the client (or created by the server). It is the only key to the memory, so keep it unguessable.
+    conversation_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{16,64}$")
+
+    @field_validator("message")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        v = " ".join(v.split())
+        if not v:
+            raise ValueError("message is empty")
         return v
 
 
@@ -53,23 +71,37 @@ class RateLimiter:
 def create_app(settings: Settings | None = None, provider: AIProvider | None = None) -> FastAPI:
     settings = settings or get_settings()
     setup_logging(settings.log_level)
-    state: dict = {"rag": None, "error": None}
+    state: dict = {"rag": None, "agent": None, "error": None}
+    db = GymDB(settings.gym_db_path)  # works without an AI key, so /schedule is always available
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        memory_conn = None
         try:
             prov = provider or build_provider(settings)
             kb = KnowledgeBase(settings.chroma_dir, settings.collection)
             kb.build(load_chunks(settings.knowledge_dir), prov)
             state["rag"] = RAGService(kb, prov, settings.top_k, settings.min_similarity)
+            settings.memory_db_path.parent.mkdir(parents=True, exist_ok=True)
+            memory_conn = sqlite3.connect(str(settings.memory_db_path), check_same_thread=False)
+            state["agent"] = GymAgent(state["rag"], db, prov, SqliteSaver(memory_conn))
             log.info("ready", extra={"fields": {"provider": prov.name, "chunks": kb.count()}})
         except AIProviderError as e:
             state["error"] = str(e)
             log.error("AI provider not available", extra={"fields": {"reason": str(e)}})
         yield
+        if memory_conn is not None:
+            memory_conn.close()
 
-    app = FastAPI(title="Gym AI Assistant", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Gym AI Assistant", version="0.2.0", lifespan=lifespan)
     limiter = RateLimiter(settings.rate_limit_per_minute)
+
+    def guard(text: str, request: Request) -> None:
+        if len(text) > settings.max_question_chars:
+            raise HTTPException(422, f"message is longer than {settings.max_question_chars} characters")
+        client = request.client.host if request.client else "unknown"
+        if not limiter.allow(client):
+            raise HTTPException(429, "Too many messages — please wait a minute.")
 
     @app.middleware("http")
     async def request_log(request: Request, call_next):
@@ -95,11 +127,8 @@ def create_app(settings: Settings | None = None, provider: AIProvider | None = N
 
     @app.post("/ask", response_model=Answer)
     def ask(body: AskRequest, request: Request):
-        if len(body.question) > settings.max_question_chars:
-            raise HTTPException(422, f"question is longer than {settings.max_question_chars} characters")
-        client = request.client.host if request.client else "unknown"
-        if not limiter.allow(client):
-            raise HTTPException(429, "Too many questions — please wait a minute.")
+        """One-shot question answered from the knowledge base (no memory, no tools)."""
+        guard(body.question, request)
         rag: RAGService | None = state["rag"]
         if rag is None:
             raise HTTPException(503, "The assistant is not configured yet.")
@@ -108,6 +137,25 @@ def create_app(settings: Settings | None = None, provider: AIProvider | None = N
         except AIProviderError:
             log.exception("AI provider failed")
             raise HTTPException(503, "The AI service is busy right now — please try again shortly.")
+
+    @app.post("/chat", response_model=ChatResult)
+    def chat(body: ChatRequest, request: Request):
+        """Conversation with the agent: questions, class schedule, bookings and complaints, with memory."""
+        guard(body.message, request)
+        agent: GymAgent | None = state["agent"]
+        if agent is None:
+            raise HTTPException(503, "The assistant is not configured yet.")
+        try:
+            return agent.chat(body.message, body.conversation_id or uuid.uuid4().hex)
+        except AIProviderError:
+            log.exception("AI provider failed")
+            raise HTTPException(503, "The AI service is busy right now — please try again shortly.")
+
+    @app.get("/schedule")
+    def schedule(class_name: str | None = Query(default=None, max_length=40),
+                 day: str | None = Query(default=None, max_length=12)):
+        """Class timetable (demo data) with free spots."""
+        return {"demo": True, "sessions": db.schedule(class_name, day)}
 
     @app.exception_handler(Exception)
     async def unexpected(_: Request, exc: Exception):

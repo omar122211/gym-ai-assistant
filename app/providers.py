@@ -19,6 +19,10 @@ Kind = Literal["document", "query"]
 class AIProviderError(RuntimeError):
     """The AI service failed (bad key, quota, network). Safe to show a generic message."""
 
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
 
 class AIProvider(Protocol):
     name: str
@@ -35,13 +39,15 @@ class GeminiProvider:
     name = "gemini"
     _RETRYABLE = {429, 500, 502, 503, 504}
 
-    def __init__(self, api_key: str, chat_model: str, embed_model: str, embed_dim: int, max_retries: int = 4):
+    def __init__(self, api_key: str, chat_model: str, embed_model: str, embed_dim: int,
+                 fallback_chat_model: str | None = None, max_retries: int = 2):
         from google import genai  # imported here so tests don't need the SDK configured
 
         self._genai_types = __import__("google.genai.types", fromlist=["types"])
         self._errors = __import__("google.genai.errors", fromlist=["errors"])
         self.client = genai.Client(api_key=api_key)
         self.chat_model, self.embed_model, self.embed_dim = chat_model, embed_model, embed_dim
+        self.fallback_chat_model = fallback_chat_model
         self.max_retries = max_retries
 
     def _call(self, fn, *args, **kwargs):
@@ -56,7 +62,7 @@ class GeminiProvider:
                     log.warning("gemini retry", extra={"fields": {"code": code, "wait_s": wait, "attempt": attempt + 1}})
                     time.sleep(wait)
                     continue
-                raise AIProviderError(f"Gemini API error {code}") from e
+                raise AIProviderError(f"Gemini API error {code}", code) from e
         raise AIProviderError("Gemini API: retries exhausted")
 
     def embed(self, texts: list[str], *, kind: Kind) -> list[list[float]]:
@@ -89,7 +95,17 @@ class GeminiProvider:
             response_mime_type="application/json",
             response_schema=schema,
         )
-        response = self._call(self.client.models.generate_content, model=self.chat_model, contents=prompt, config=config)
+        models = [self.chat_model] + ([self.fallback_chat_model] if self.fallback_chat_model else [])
+        for i, model in enumerate(models):
+            try:
+                response = self._call(self.client.models.generate_content, model=model, contents=prompt, config=config)
+                break
+            except AIProviderError as e:
+                # model overloaded or out of quota → try the next model instead of failing the user
+                if e.code in (429, 503) and i + 1 < len(models):
+                    log.warning("gemini fallback", extra={"fields": {"from": model, "to": models[i + 1], "code": e.code}})
+                    continue
+                raise
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, schema):
             return parsed
@@ -120,7 +136,13 @@ class FakeProvider:
         return out
 
     def generate(self, *, system: str, prompt: str, schema: type[T], temperature: float = 0.2) -> T:
-        self.calls.append({"system": system, "prompt": prompt})
+        self.calls.append({"system": system, "prompt": prompt, "schema": schema.__name__})
+        fields = schema.model_fields
+        if "intent" in fields:  # agent router
+            return schema.model_validate(self._route(system, prompt))
+        if "reply" in fields:  # agent reply: echo the tool result so tests can check it
+            result = re.search(r"<result>\n(.*?)\n</result>", prompt, re.S)
+            return schema.model_validate({"reply": f"[fake] {result.group(1) if result else ''}"})
         has_context = "[1]" in prompt
         return schema.model_validate({
             "language": "en",
@@ -128,6 +150,37 @@ class FakeProvider:
             "answer": "Answer based on the gym knowledge base." if has_context else "I don't have that information.",
             "used_sources": [1] if has_context else [],
         })
+
+    # A tiny keyword router — good enough to test the graph without a real model.
+    _INTENTS = [("booking", ("book", "reserve", "sign me up")), ("schedule", ("schedule", "when is", "timetable")),
+                ("complaint", ("complain", "broken", "dirty", "rude")), ("greeting", ("hello", "hi ", "thanks")),
+                ("out_of_scope", ("weather", "bitcoin", "football"))]
+
+    def _route(self, system: str, prompt: str) -> dict:
+        latest = re.search(r"<latest>\n(.*?)\n</latest>", prompt, re.S).group(1)
+        convo = re.search(r"<conversation>\n(.*?)\n</conversation>", prompt, re.S).group(1)
+        user_lines = [line[6:] for line in convo.splitlines() if line.startswith("User: ")]
+        classes = re.search(r"Known classes: (.*?)\. Days:", system).group(1).split(", ")
+        days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+        def intent_of(text: str) -> str | None:
+            low = f" {text.lower()} "
+            return next((name for name, words in self._INTENTS if any(w in low for w in words)), None)
+
+        intent = intent_of(latest)
+        if intent is None:  # a follow-up like "Friday" or "my name is ..." continues the last request
+            previous = next((i for i in map(intent_of, reversed(user_lines)) if i), None)
+            intent = "booking" if previous == "booking" else None
+        text = " ".join(user_lines + [latest])
+        low = text.lower()
+        # latest-mentioned class wins; on the same end position the longer name wins ("kick-boxing" over "boxing")
+        found_class = max(((low.rfind(c.lower()) + len(c), len(c), c) for c in classes if c.lower() in low),
+                          default=(-1, 0, None))[2]
+        found_day = max(((low.rfind(d), d.title()) for d in days if d in low), default=(-1, None))[1]
+        name = re.findall(r"my name is (\w+)", text, re.I)
+        return {"intent": intent or "question", "language": "en", "standalone_question": latest,
+                "class_name": found_class, "day": found_day, "member_name": name[-1] if name else None,
+                "complaint_summary": latest if intent == "complaint" else None}
 
 
 def _normalize(values) -> list[float]:
@@ -144,4 +197,5 @@ def build_provider(settings) -> AIProvider:
         chat_model=settings.chat_model,
         embed_model=settings.embed_model,
         embed_dim=settings.embed_dim,
+        fallback_chat_model=settings.fallback_chat_model,
     )

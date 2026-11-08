@@ -13,7 +13,8 @@ from app.rag import RAGService
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(gemini_api_key=None, chroma_dir=tmp_path / "chroma", rate_limit_per_minute=3)
+    return Settings(gemini_api_key=None, chroma_dir=tmp_path / "chroma", rate_limit_per_minute=3,
+                    gym_db_path=tmp_path / "gym.db", memory_db_path=tmp_path / "memory.db")
 
 
 @pytest.fixture
