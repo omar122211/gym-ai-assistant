@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     gym_db_path: Path = ROOT / "data" / "gym.db"
     memory_db_path: Path = ROOT / "data" / "memory.db"
 
+    # Staff tools (/staff/* endpoints + Streamlit staff page). Unset = turned off.
+    staff_token: SecretStr | None = None
+
     # API safety limits
     max_question_chars: int = 500
     rate_limit_per_minute: int = 20

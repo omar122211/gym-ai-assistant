@@ -79,7 +79,7 @@ pip install -r requirements.txt
 copy .env.example .env                                 # then add your key
 uvicorn app.api:app                                    # terminal 1 — API on :8000
 streamlit run ui/streamlit_app.py                      # terminal 2 — chat UI on :8501
-pytest                                                 # 24 offline tests, no key needed
+pytest                                                 # 35 offline tests, no key needed
 ```
 
 ## API
@@ -90,6 +90,19 @@ pytest                                                 # 24 offline tests, no ke
 | `POST /ask` | one-shot RAG question, no memory or tools |
 | `GET /schedule` | timetable with free spots (`?class_name=&day=`) |
 | `GET /health` | status, provider, indexed chunks |
+| `GET /staff/report` | totals, bookings per class, busiest days, tickets by status · needs `X-Staff-Token` |
+| `GET /staff/bookings` · `DELETE /staff/bookings/{id}` | list (`?session_id=`) and cancel bookings · needs `X-Staff-Token` |
+| `GET /staff/tickets` · `PATCH /staff/tickets/{id}` | list (`?status=`) and update the status (`open` / `in_progress` / `resolved`) · needs `X-Staff-Token` |
+
+Staff routes are off unless `STAFF_TOKEN` is set; wrong tokens are limited to 5 a minute. The Streamlit app has a
+**Staff desk** page (sidebar) that uses them: report and chart, ticket statuses, and cancelling bookings.
+
+### Database and schema changes
+
+SQLite with three tables (`sessions`, `bookings`, `tickets`) and foreign keys enforced. The schema is versioned:
+`app/gym_db.py` keeps an append-only list of migrations, SQLite stores the applied version in `PRAGMA user_version`,
+and on start-up each newer migration runs once inside its own transaction. Existing databases upgrade in place
+(tested from a version-0 file with data in it).
 
 ## Project layout
 
@@ -98,10 +111,11 @@ app/
   agent.py         LangGraph graph: understand → tool → compose → remember
   rag.py           retrieval + grounded answers
   knowledge.py     Markdown → chunks → embeddings → Chroma (rebuilt only when files change)
-  gym_db.py        SQLite tools: schedule, bookings, tickets
+  gym_db.py        SQLite: versioned migrations, schedule, bookings, tickets, staff CRUD + report
   providers.py     AIProvider interface · Gemini (retries + fallback model) · offline fake for tests
-  api.py           FastAPI: /chat /ask /schedule /health, rate limit, request logging
+  api.py           FastAPI: /chat /ask /schedule /health /staff/*, rate limit, request logging
 ui/streamlit_app.py chat UI
+ui/pages/          Staff desk page (report, tickets, bookings)
 knowledge/         the gym's facts (Markdown)
 eval/              test set, runner and results
 tests/             offline tests (pytest)

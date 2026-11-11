@@ -24,7 +24,12 @@ DEMO_SCHEDULE = [
 ]
 CAPACITY = 12
 
-SCHEMA = """
+TICKET_STATUSES = ("open", "in_progress", "resolved")
+
+# ---------------------------------------------------------------- schema management
+# Versioned migrations. SQLite keeps the applied version in `PRAGMA user_version`; on start-up every migration
+# newer than that runs once, in order, inside a transaction. Never edit an old migration: add a new one.
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   class_name TEXT NOT NULL, trainer TEXT, day TEXT NOT NULL, time TEXT NOT NULL,
@@ -44,6 +49,48 @@ CREATE TABLE IF NOT EXISTS tickets (
 """
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _v1_initial_schema(conn: sqlite3.Connection) -> None:
+    for statement in filter(str.strip, SCHEMA_V1.split(";")):
+        conn.execute(statement)
+
+
+def _v2_indexes_and_ticket_updates(conn: sqlite3.Connection) -> None:
+    # Indexes for the lookups the app does most: bookings by session, tickets by status
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bookings_session ON bookings(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
+    if "updated_at" not in _columns(conn, "tickets"):  # staff can now change a ticket's status
+        conn.execute("ALTER TABLE tickets ADD COLUMN updated_at TEXT")
+
+
+MIGRATIONS = [  # (version, function) — append only
+    (1, _v1_initial_schema),
+    (2, _v2_indexes_and_ticket_updates),
+]
+LATEST_VERSION = MIGRATIONS[-1][0]
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Bring the database up to LATEST_VERSION. Returns the version it started from."""
+    start = conn.execute("PRAGMA user_version").fetchone()[0]
+    for version, apply in MIGRATIONS:
+        if version > start:
+            # One explicit transaction per migration: it fully applies or not at all.
+            # (Python's sqlite3 doesn't open a transaction for CREATE/ALTER by itself.)
+            conn.execute("BEGIN")
+            try:
+                apply(conn)
+                conn.execute(f"PRAGMA user_version = {int(version)}")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    return start
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -58,9 +105,11 @@ class GymDB:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")  # SQLite only enforces REFERENCES when this is on
         self.lock = threading.Lock()
+        with self.lock:
+            migrate(self.conn)
         with self.lock, self.conn:
-            self.conn.executescript(SCHEMA)
             if self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0:
                 self.conn.executemany(
                     "INSERT INTO sessions (class_name, trainer, day, time, capacity) VALUES (?, ?, ?, ?, ?)",
@@ -113,6 +162,64 @@ class GymDB:
                 "INSERT INTO tickets (summary, language, conversation_id, created_at) VALUES (?, ?, ?, ?)",
                 (summary[:1000], language, conversation_id, _now()))
             return cur.lastrowid
+
+    # ------------------------------------------------------------------ staff tools (read / update / delete)
+    def list_bookings(self, session_id: int | None = None) -> list[dict]:
+        sql = """SELECT b.id, b.member_name, b.created_at, s.id AS session_id, s.class_name, s.day, s.time
+                 FROM bookings b JOIN sessions s ON s.id = b.session_id"""
+        params: tuple = ()
+        if session_id is not None:
+            sql += " WHERE b.session_id = ?"
+            params = (session_id,)
+        sql += " ORDER BY s.id, b.created_at"
+        return [dict(r) for r in self.conn.execute(sql, params)]
+
+    def cancel_booking(self, booking_id: int) -> bool:
+        """DELETE one booking. Returns False if there was no such booking."""
+        with self.lock, self.conn:
+            return self.conn.execute("DELETE FROM bookings WHERE id = ?", (booking_id,)).rowcount == 1
+
+    def list_tickets(self, status: str | None = None) -> list[dict]:
+        if status is not None and status not in TICKET_STATUSES:
+            raise ValueError(f"status must be one of {TICKET_STATUSES}")
+        sql = "SELECT id, summary, language, status, created_at, updated_at FROM tickets"
+        params: tuple = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY created_at DESC, id DESC"
+        return [dict(r) for r in self.conn.execute(sql, params)]
+
+    def update_ticket_status(self, ticket_id: int, status: str) -> bool:
+        """UPDATE a ticket's status. Returns False if there was no such ticket."""
+        if status not in TICKET_STATUSES:
+            raise ValueError(f"status must be one of {TICKET_STATUSES}")
+        with self.lock, self.conn:
+            cur = self.conn.execute("UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?", (status, _now(), ticket_id))
+            return cur.rowcount == 1
+
+    def report(self) -> dict:
+        """Aggregates for the staff page (GROUP BY / HAVING / ORDER BY)."""
+        per_class = self.conn.execute(
+            """SELECT s.class_name,
+                      COUNT(b.id) AS bookings,
+                      (SELECT SUM(capacity) FROM sessions x WHERE x.class_name = s.class_name) AS seats
+               FROM sessions s LEFT JOIN bookings b ON b.session_id = s.id
+               GROUP BY s.class_name
+               ORDER BY bookings DESC, s.class_name""").fetchall()
+        busiest_days = self.conn.execute(
+            """SELECT s.day, COUNT(*) AS bookings
+               FROM bookings b JOIN sessions s ON s.id = b.session_id
+               GROUP BY s.day HAVING COUNT(*) > 0
+               ORDER BY bookings DESC""").fetchall()
+        tickets = self.conn.execute("SELECT status, COUNT(*) AS n FROM tickets GROUP BY status").fetchall()
+        by_status = {s: 0 for s in TICKET_STATUSES} | {r["status"]: r["n"] for r in tickets}
+        return {
+            "totals": self.counts(),
+            "per_class": [dict(r) for r in per_class],
+            "busiest_days": [dict(r) for r in busiest_days],
+            "tickets_by_status": by_status,
+        }
 
     def counts(self) -> dict:
         return {t: self.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("sessions", "bookings", "tickets")}

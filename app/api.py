@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, field_validator
@@ -48,6 +50,10 @@ class ChatRequest(BaseModel):
         if not v:
             raise ValueError("message is empty")
         return v
+
+
+class TicketUpdate(BaseModel):
+    status: Literal["open", "in_progress", "resolved"]
 
 
 class RateLimiter:
@@ -156,6 +162,49 @@ def create_app(settings: Settings | None = None, provider: AIProvider | None = N
                  day: str | None = Query(default=None, max_length=12)):
         """Class timetable (demo data) with free spots."""
         return {"demo": True, "sessions": db.schedule(class_name, day)}
+
+    # ---------------------------------------------------------------- staff tools
+    failed_logins = RateLimiter(5)  # wrong tokens per client per minute (stops guessing)
+
+    def require_staff(request: Request, x_staff_token: str | None = Header(default=None)) -> None:
+        """Every /staff route needs the STAFF_TOKEN in the X-Staff-Token header."""
+        expected = settings.staff_token.get_secret_value() if settings.staff_token else ""
+        if not expected:
+            raise HTTPException(503, "Staff tools are turned off (set STAFF_TOKEN).")
+        if not x_staff_token or not secrets.compare_digest(x_staff_token.encode(), expected.encode()):
+            client = request.client.host if request.client else "unknown"
+            if not failed_logins.allow(client):
+                raise HTTPException(429, "Too many wrong tokens — wait a minute.")
+            raise HTTPException(401, "Wrong or missing staff token.")
+
+    staff = [Depends(require_staff)]
+
+    @app.get("/staff/report", dependencies=staff)
+    def staff_report():
+        """Totals, bookings per class, busiest days and tickets by status."""
+        return db.report()
+
+    @app.get("/staff/bookings", dependencies=staff)
+    def staff_bookings(session_id: int | None = Query(default=None, ge=1)):
+        return {"bookings": db.list_bookings(session_id)}
+
+    @app.delete("/staff/bookings/{booking_id}", dependencies=staff)
+    def staff_cancel_booking(booking_id: int):
+        if not db.cancel_booking(booking_id):
+            raise HTTPException(404, "No booking with that id.")
+        log.info("booking cancelled", extra={"fields": {"booking_id": booking_id}})
+        return {"cancelled": booking_id}
+
+    @app.get("/staff/tickets", dependencies=staff)
+    def staff_tickets(status: Literal["open", "in_progress", "resolved"] | None = None):
+        return {"tickets": db.list_tickets(status)}
+
+    @app.patch("/staff/tickets/{ticket_id}", dependencies=staff)
+    def staff_update_ticket(ticket_id: int, body: TicketUpdate):
+        if not db.update_ticket_status(ticket_id, body.status):
+            raise HTTPException(404, "No ticket with that id.")
+        log.info("ticket updated", extra={"fields": {"ticket_id": ticket_id, "status": body.status}})
+        return {"id": ticket_id, "status": body.status}
 
     @app.exception_handler(Exception)
     async def unexpected(_: Request, exc: Exception):
